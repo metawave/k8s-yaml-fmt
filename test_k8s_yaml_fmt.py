@@ -1072,6 +1072,24 @@ line_width: 0
         assert config.sequence_offset == 0
         assert config.line_width == 4096
 
+    def test_sequence_offset_auto_adjusts_sequence_indent(self):
+        """sequence_indent must be >= sequence_offset + 2 for valid YAML."""
+        # When sequence_offset=2, sequence_indent should auto-adjust to 4
+        config = Config(sequence_offset=2)
+        assert config.sequence_indent == 4
+        assert config.sequence_offset == 2
+
+        # When sequence_indent is explicitly large enough, no adjustment
+        config = Config(sequence_indent=6, sequence_offset=2)
+        assert config.sequence_indent == 6
+
+        # Verify the output is valid YAML
+        content = minimal_deployment()
+        formatted, has_k8s = format_yaml_content(content, Config(sequence_offset=2))
+        assert has_k8s is True
+        assert "- name: app" in formatted
+        assert "  image:" in formatted  # image should be indented under the dash
+
     def test_load_config_partial_formatting_options(self, tmp_path):
         config_file = tmp_path / CONFIG_FILE_NAME
         config_file.write_text("""

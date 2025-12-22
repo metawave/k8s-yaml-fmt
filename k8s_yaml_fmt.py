@@ -50,6 +50,12 @@ class Config:
     sequence_offset: int = 0  # Offset for sequence items (0 or 2 common)
     line_width: int = 4096  # Max line width before wrapping (high = no wrap)
 
+    def __post_init__(self):
+        # sequence_indent must be >= sequence_offset + 2 for valid YAML output
+        min_sequence_indent = self.sequence_offset + 2
+        if self.sequence_indent < min_sequence_indent:
+            self.sequence_indent = min_sequence_indent
+
     def get_spec_order(self, kind: str) -> list:
         """Get spec order for a kind, checking additional_kinds first."""
         if kind in self.additional_kinds:
@@ -118,11 +124,19 @@ def load_config(config_path: Optional[Path] = None) -> Config:
                 if isinstance(fields, list):
                     additional_kinds[kind] = fields
 
+        sequence_indent = _validated_int(data, "sequence_indent", 2)
+        sequence_offset = _validated_int(data, "sequence_offset", 0, min_val=0)
+
+        # sequence_indent must be >= sequence_offset + 2 for valid YAML output
+        min_sequence_indent = sequence_offset + 2
+        if sequence_indent < min_sequence_indent:
+            sequence_indent = min_sequence_indent
+
         return Config(
             additional_kinds=additional_kinds,
             indent=_validated_int(data, "indent", 2),
-            sequence_indent=_validated_int(data, "sequence_indent", 2),
-            sequence_offset=_validated_int(data, "sequence_offset", 0, min_val=0),
+            sequence_indent=sequence_indent,
+            sequence_offset=sequence_offset,
             line_width=_validated_int(data, "line_width", 4096),
         )
 
