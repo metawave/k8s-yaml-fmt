@@ -32,6 +32,8 @@ But most YAML formatters either sort alphabetically (wrong!) or preserve origina
 - **Idiomatic ordering:** `apiVersion` → `kind` → `metadata` → `spec`, and kind-specific field ordering
 - **Comment-preserving:** Keeps your YAML comments intact
 - **Multi-document:** Handles `---` separated files
+- **Configurable:** Customize indent, sequence offset, and line width to match your project style
+- **CRD support:** Add custom resource kinds via config file
 
 ## Installation
 
@@ -115,18 +117,83 @@ repos:
         exclude: '\.sops\.yaml$'
 ```
 
+## Configuration
+
+Create a `.k8s-yaml-fmt.yaml` file in your project root:
+
+```yaml
+# Custom resource kinds (CRDs) with their spec field ordering
+additional_kinds:
+  MyCustomResource:
+    - replicas
+    - selector
+    - template
+  AnotherCRD:
+    - config
+    - settings
+
+# Formatting options (to match your project's YAML style)
+indent: 2              # Mapping indent (default: 2)
+sequence_indent: 2     # Sequence indent (default: 2)
+sequence_offset: 0     # Offset for sequence items (default: 0)
+line_width: 4096       # Max line width before wrapping (default: 4096, high = no wrap)
+```
+
+### Formatting Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `indent` | 2 | Number of spaces for mapping (object) indentation |
+| `sequence_indent` | 2 | Number of spaces for sequence (list) indentation |
+| `sequence_offset` | 0 | Offset for sequence item content from the dash |
+| `line_width` | 4096 | Maximum line width before wrapping (high value = no wrapping) |
+
+Example with different indent styles:
+
+```yaml
+# Default (indent: 2, sequence_indent: 2, sequence_offset: 0)
+spec:
+  containers:
+  - name: app
+    image: nginx
+
+# With sequence_offset: 2
+spec:
+  containers:
+    - name: app
+      image: nginx
+
+# With indent: 4
+spec:
+    containers:
+    - name: app
+      image: nginx
+```
+
+### Config File Discovery
+
+The config file is auto-discovered by searching:
+1. Current directory
+2. Parent directories (up to git root)
+3. Home directory
+
+Or specify explicitly:
+
+```bash
+k8s-yaml-fmt --config /path/to/.k8s-yaml-fmt.yaml deployment.yaml
+```
+
 ## Supported Resources
 
-Only these resource kinds are formatted (others are skipped):
+Only resource kinds with field ordering are formatted (others are skipped):
 
 - **Workloads:** Deployment, StatefulSet, DaemonSet, ReplicaSet, Pod, Job, CronJob
-- **Networking:** Service, Ingress, NetworkPolicy, Endpoints
-- **Config:** ConfigMap, Secret
+- **Networking:** Service, Ingress, NetworkPolicy
 - **Storage:** PersistentVolume, PersistentVolumeClaim
 - **Auth:** ServiceAccount, Role, ClusterRole, RoleBinding, ClusterRoleBinding
-- **Other:** Namespace, HorizontalPodAutoscaler, PodDisruptionBudget, ResourceQuota, LimitRange
+- **Other:** HorizontalPodAutoscaler, PodDisruptionBudget
 
-Files without a supported `kind` are automatically skipped (docker-compose.yaml, GitHub Actions, Ansible playbooks, CRDs, etc.).
+Resources without complex fields (ConfigMap, Secret, Namespace, etc.) are skipped since they only benefit from basic YAML formatting.
 
 ## Key Ordering
 
@@ -159,6 +226,24 @@ envFrom → env → resources → volumeMounts → livenessProbe → readinessPr
 
 ```
 name → port → targetPort → protocol → nodePort
+```
+
+### Role/ClusterRole rules
+
+```
+apiGroups → resources → resourceNames → verbs → nonResourceURLs
+```
+
+### RoleBinding/ClusterRoleBinding subjects
+
+```
+kind → apiGroup → name → namespace
+```
+
+### RoleBinding/ClusterRoleBinding roleRef
+
+```
+kind → apiGroup → name
 ```
 
 ## Example
@@ -220,15 +305,17 @@ spec:
 git clone https://github.com/metawave/k8s-yaml-fmt.git
 cd k8s-yaml-fmt
 
-# Install in dev mode
-pip install -e .
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install in dev mode with test dependencies
+pip install -e ".[dev]"
 
 # Run tests
-pip install pytest
 pytest -v
 
 # Run linter
-pip install ruff
 ruff check k8s_yaml_fmt.py
 ```
 

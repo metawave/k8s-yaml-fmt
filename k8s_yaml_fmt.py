@@ -11,16 +11,124 @@ Usage:
     k8s_yaml_fmt.py <file.yaml> [file2.yaml ...]
     k8s_yaml_fmt.py --check <file.yaml>    # Check only, exit 1 if changes needed
     k8s_yaml_fmt.py --diff <file.yaml>     # Show diff without modifying
+
+Configuration:
+    Create .k8s-yaml-fmt.yaml in your project root:
+
+    additional_kinds:
+      MyCustomResource:
+        - field1
+        - field2
 """
 
-import sys
 import argparse
-from pathlib import Path
-from io import StringIO
 import difflib
+import sys
+from dataclasses import dataclass, field
+from io import StringIO
+from pathlib import Path
+from typing import Optional
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.error import YAMLError, YAMLStreamError
+
+# Config file name
+CONFIG_FILE_NAME = ".k8s-yaml-fmt.yaml"
+
+
+@dataclass
+class Config:
+    """Configuration for the formatter."""
+
+    # Custom resource kinds with their spec field ordering
+    additional_kinds: dict = field(default_factory=dict)
+
+    # Formatting options
+    indent: int = 2  # Mapping indent
+    sequence_indent: int = 2  # Sequence indent
+    sequence_offset: int = 0  # Offset for sequence items (0 or 2 common)
+    line_width: int = 4096  # Max line width before wrapping (high = no wrap)
+
+    def get_spec_order(self, kind: str) -> list:
+        """Get spec order for a kind, checking additional_kinds first."""
+        if kind in self.additional_kinds:
+            return self.additional_kinds[kind]
+        return SPEC_ORDERS.get(kind, [])
+
+    def is_supported_kind(self, kind: str) -> bool:
+        """Check if a kind is supported (built-in or additional)."""
+        return kind in SPEC_ORDERS or kind in self.additional_kinds
+
+
+def find_config_file(start_path: Optional[Path] = None) -> Optional[Path]:
+    """
+    Find config file by searching:
+    1. Current directory (or start_path)
+    2. Parent directories up to git root or filesystem root
+    3. Home directory
+    """
+    search_path = start_path or Path.cwd()
+
+    # Search current and parent directories
+    current = search_path.resolve()
+    while current != current.parent:
+        config_path = current / CONFIG_FILE_NAME
+        if config_path.exists():
+            return config_path
+        # Stop at git root
+        if (current / ".git").exists():
+            break
+        current = current.parent
+
+    # Check home directory
+    home_config = Path.home() / CONFIG_FILE_NAME
+    if home_config.exists():
+        return home_config
+
+    return None
+
+
+def _validated_int(data: dict, key: str, default: int, min_val: int = 1) -> int:
+    """Get an integer config value with validation, returning default if invalid."""
+    value = data.get(key, default)
+    return value if isinstance(value, int) and value >= min_val else default
+
+
+def load_config(config_path: Optional[Path] = None) -> Config:
+    """Load configuration from file or return defaults."""
+    if config_path is None:
+        config_path = find_config_file()
+
+    if config_path is None or not config_path.exists():
+        return Config()
+
+    try:
+        yaml = YAML()
+        with open(config_path) as f:
+            data = yaml.load(f)
+
+        if data is None:
+            return Config()
+
+        # Parse additional_kinds
+        additional_kinds = {}
+        if "additional_kinds" in data and isinstance(data["additional_kinds"], dict):
+            for kind, fields in data["additional_kinds"].items():
+                if isinstance(fields, list):
+                    additional_kinds[kind] = fields
+
+        return Config(
+            additional_kinds=additional_kinds,
+            indent=_validated_int(data, "indent", 2),
+            sequence_indent=_validated_int(data, "sequence_indent", 2),
+            sequence_offset=_validated_int(data, "sequence_offset", 0, min_val=0),
+            line_width=_validated_int(data, "line_width", 4096),
+        )
+
+    except Exception as e:
+        print(f"Warning: Failed to load config from {config_path}: {e}", file=sys.stderr)
+        return Config()
 
 # Key ordering definitions
 TOP_LEVEL_ORDER = [
@@ -30,7 +138,6 @@ TOP_LEVEL_ORDER = [
     "spec",
     "data",
     "stringData",
-    "binaryData",
     "type",
     "immutable",
     "rules",
@@ -85,8 +192,6 @@ SPEC_ORDERS = {
         "tls",
         "rules",
     ],
-    "ConfigMap": [],
-    "Secret": [],
     "Pod": [
         "serviceAccountName",
         "serviceAccount",
@@ -192,25 +297,22 @@ SPEC_ORDERS = {
         "ingress",
         "egress",
     ],
-    "Role": [],
-    "ClusterRole": [],
-    "RoleBinding": [],
-    "ClusterRoleBinding": [],
-    "Namespace": [],
     "ReplicaSet": [
         "replicas",
         "selector",
         "minReadySeconds",
         "template",
     ],
-    "Endpoints": [],
-    "ResourceQuota": [],
-    "LimitRange": [],
     "PodDisruptionBudget": [
         "selector",
         "minAvailable",
         "maxUnavailable",
     ],
+    # RBAC resources (no spec, but recognized for rules/subjects/roleRef formatting)
+    "Role": [],
+    "ClusterRole": [],
+    "RoleBinding": [],
+    "ClusterRoleBinding": [],
 }
 
 CONTAINER_ORDER = [
@@ -237,8 +339,6 @@ CONTAINER_ORDER = [
     "terminationMessagePath",
     "terminationMessagePolicy",
 ]
-
-POD_TEMPLATE_SPEC_ORDER = SPEC_ORDERS["Pod"]
 
 RESOURCES_ORDER = ["requests", "limits"]
 
@@ -299,6 +399,51 @@ SELECTOR_ORDER = ["matchLabels", "matchExpressions"]
 
 SERVICE_PORT_ORDER = ["name", "port", "targetPort", "protocol", "nodePort", "appProtocol"]
 
+# RBAC ordering
+RBAC_RULE_ORDER = [
+    "apiGroups",
+    "resources",
+    "resourceNames",
+    "verbs",
+    "nonResourceURLs",
+]
+
+SUBJECT_ORDER = [
+    "kind",
+    "apiGroup",
+    "name",
+    "namespace",
+]
+
+ROLE_REF_ORDER = [
+    "kind",
+    "apiGroup",
+    "name",
+]
+
+
+def copy_yaml_comments(source, dest, key_type: str = "map"):
+    """
+    Copy ruamel.yaml comments from source to dest.
+
+    Args:
+        source: Source CommentedMap or CommentedSeq
+        dest: Destination CommentedMap or CommentedSeq
+        key_type: "map" for dict keys, "seq" for list indices
+    """
+    if hasattr(source, "ca") and source.ca:
+        dest.ca.comment = source.ca.comment
+        if key_type == "map":
+            for key in dest:
+                if key in source.ca.items:
+                    dest.ca.items[key] = source.ca.items[key]
+        else:  # seq
+            for idx in source.ca.items:
+                if idx < len(dest):
+                    dest.ca.items[idx] = source.ca.items[idx]
+        if hasattr(source.ca, "end") and source.ca.end:
+            dest.ca.end = source.ca.end
+
 
 def sort_map(data: CommentedMap, key_order: list) -> CommentedMap:
     """Sort a CommentedMap according to key_order, preserving comments."""
@@ -317,13 +462,7 @@ def sort_map(data: CommentedMap, key_order: list) -> CommentedMap:
         if key not in result:
             result[key] = data[key]
 
-    # Preserve comments
-    if hasattr(data, "ca") and data.ca:
-        result.ca.comment = data.ca.comment
-        for key in result:
-            if key in data.ca.items:
-                result.ca.items[key] = data.ca.items[key]
-
+    copy_yaml_comments(data, result, key_type="map")
     return result
 
 
@@ -339,37 +478,23 @@ def format_list(items: CommentedSeq, item_formatter) -> CommentedSeq:
         else:
             result.append(item)
 
-    # Preserve comments
-    if hasattr(items, "ca") and items.ca:
-        result.ca.comment = items.ca.comment
-        for idx in items.ca.items:
-            if idx < len(result):
-                result.ca.items[idx] = items.ca.items[idx]
-
+    copy_yaml_comments(items, result, key_type="seq")
     return result
 
 
-def format_container(container: CommentedMap) -> CommentedMap:
-    """Format a container spec."""
-    if not isinstance(container, CommentedMap):
-        return container
+def _format_list_field(obj: CommentedMap, key: str, order: list):
+    """Format a list field in-place if present and non-empty."""
+    if key in obj and obj[key]:
+        obj[key] = format_list(obj[key], lambda item: sort_map(item, order))
 
+
+def format_container(container: CommentedMap) -> CommentedMap:
+    """Format a container spec. Caller must ensure container is a CommentedMap."""
     container = sort_map(container, CONTAINER_ORDER)
 
-    if "ports" in container and container["ports"]:
-        container["ports"] = format_list(
-            container["ports"], lambda p: sort_map(p, PORT_ORDER)
-        )
-
-    if "env" in container and container["env"]:
-        container["env"] = format_list(
-            container["env"], lambda e: sort_map(e, ENV_ORDER)
-        )
-
-    if "volumeMounts" in container and container["volumeMounts"]:
-        container["volumeMounts"] = format_list(
-            container["volumeMounts"], lambda vm: sort_map(vm, VOLUME_MOUNT_ORDER)
-        )
+    _format_list_field(container, "ports", PORT_ORDER)
+    _format_list_field(container, "env", ENV_ORDER)
+    _format_list_field(container, "volumeMounts", VOLUME_MOUNT_ORDER)
 
     if "resources" in container:
         container["resources"] = sort_map(container["resources"], RESOURCES_ORDER)
@@ -378,9 +503,7 @@ def format_container(container: CommentedMap) -> CommentedMap:
         if probe_key in container and container[probe_key]:
             container[probe_key] = sort_map(container[probe_key], PROBE_ORDER)
             if "httpGet" in container[probe_key]:
-                container[probe_key]["httpGet"] = sort_map(
-                    container[probe_key]["httpGet"], HTTP_GET_ORDER
-                )
+                container[probe_key]["httpGet"] = sort_map(container[probe_key]["httpGet"], HTTP_GET_ORDER)
 
     return container
 
@@ -390,39 +513,32 @@ def format_pod_spec(spec: CommentedMap) -> CommentedMap:
     if not isinstance(spec, CommentedMap):
         return spec
 
-    spec = sort_map(spec, POD_TEMPLATE_SPEC_ORDER)
+    spec = sort_map(spec, SPEC_ORDERS["Pod"])
 
     for container_key in ["initContainers", "containers"]:
         if container_key in spec and spec[container_key]:
             spec[container_key] = format_list(spec[container_key], format_container)
 
-    if "volumes" in spec and spec["volumes"]:
-        spec["volumes"] = format_list(
-            spec["volumes"], lambda v: sort_map(v, VOLUME_ORDER)
-        )
+    _format_list_field(spec, "volumes", VOLUME_ORDER)
 
     return spec
 
 
 def format_selector(selector: CommentedMap) -> CommentedMap:
-    """Format a selector."""
-    if not isinstance(selector, CommentedMap):
-        return selector
+    """Format a selector. Caller must ensure selector is a CommentedMap."""
     return sort_map(selector, SELECTOR_ORDER)
 
 
 def format_ingress_rules(rules) -> CommentedSeq:
     """Format Ingress rules."""
+
     def format_rule(rule):
         if not isinstance(rule, CommentedMap):
             return rule
         rule = sort_map(rule, INGRESS_RULE_ORDER)
         if "http" in rule and isinstance(rule["http"], CommentedMap):
             if "paths" in rule["http"]:
-                rule["http"]["paths"] = format_list(
-                    rule["http"]["paths"],
-                    lambda p: sort_map(p, INGRESS_PATH_ORDER)
-                )
+                rule["http"]["paths"] = format_list(rule["http"]["paths"], lambda p: sort_map(p, INGRESS_PATH_ORDER))
         return rule
 
     return format_list(rules, format_rule)
@@ -433,12 +549,29 @@ def format_ingress_tls(tls) -> CommentedSeq:
     return format_list(tls, lambda t: sort_map(t, INGRESS_TLS_ORDER))
 
 
-def format_spec(spec: CommentedMap, kind: str) -> CommentedMap:
+def format_template(template: CommentedMap, spec_formatter) -> CommentedMap:
+    """
+    Format a template (used in Deployment.spec.template, CronJob.spec.jobTemplate, etc.).
+    Caller must ensure template is a CommentedMap.
+
+    Args:
+        template: The template CommentedMap to format
+        spec_formatter: Callable to format the nested spec (e.g., format_pod_spec or format_spec)
+    """
+    if "metadata" in template:
+        template["metadata"] = sort_map(template["metadata"], METADATA_ORDER)
+    if "spec" in template:
+        template["spec"] = spec_formatter(template["spec"])
+
+    return sort_map(template, ["metadata", "spec"])
+
+
+def format_spec(spec: CommentedMap, kind: str, config: Optional[Config] = None) -> CommentedMap:
     """Format spec section based on resource kind."""
     if not isinstance(spec, CommentedMap):
         return spec
 
-    spec_order = SPEC_ORDERS.get(kind, [])
+    spec_order = config.get_spec_order(kind) if config else SPEC_ORDERS.get(kind, [])
     spec = sort_map(spec, spec_order)
 
     # Format selector if present
@@ -447,21 +580,14 @@ def format_spec(spec: CommentedMap, kind: str) -> CommentedMap:
 
     # Format template.spec for workload resources
     if "template" in spec and isinstance(spec["template"], CommentedMap):
-        template = spec["template"]
-        if "metadata" in template:
-            template["metadata"] = sort_map(template["metadata"], METADATA_ORDER)
-        if "spec" in template:
-            template["spec"] = format_pod_spec(template["spec"])
-        spec["template"] = sort_map(template, ["metadata", "spec"])
+        spec["template"] = format_template(spec["template"], format_pod_spec)
 
     # Format jobTemplate for CronJob
     if "jobTemplate" in spec and isinstance(spec["jobTemplate"], CommentedMap):
-        job_template = spec["jobTemplate"]
-        if "metadata" in job_template:
-            job_template["metadata"] = sort_map(job_template["metadata"], METADATA_ORDER)
-        if "spec" in job_template:
-            job_template["spec"] = format_spec(job_template["spec"], "Job")
-        spec["jobTemplate"] = sort_map(job_template, ["metadata", "spec"])
+        spec["jobTemplate"] = format_template(
+            spec["jobTemplate"],
+            lambda s: format_spec(s, "Job", config),
+        )
 
     # Format Ingress specifics
     if kind == "Ingress":
@@ -472,55 +598,47 @@ def format_spec(spec: CommentedMap, kind: str) -> CommentedMap:
 
     # Format Service ports
     if kind == "Service" and "ports" in spec and spec["ports"]:
-        spec["ports"] = format_list(
-            spec["ports"], lambda p: sort_map(p, SERVICE_PORT_ORDER)
-        )
+        spec["ports"] = format_list(spec["ports"], lambda p: sort_map(p, SERVICE_PORT_ORDER))
 
     return spec
 
 
 def is_sops_encrypted(doc: CommentedMap) -> bool:
     """Check if document is SOPS-encrypted (has 'sops' metadata block)."""
-    if not isinstance(doc, CommentedMap):
-        return False
-    if "sops" in doc:
-        sops_block = doc["sops"]
-        # Verify it's a real SOPS block (has typical fields)
-        if isinstance(sops_block, CommentedMap):
-            return any(key in sops_block for key in ["kms", "gcp_kms", "azure_kv", "age", "pgp", "mac", "version"])
-    return False
+    return (
+        isinstance(doc, CommentedMap)
+        and "sops" in doc
+        and isinstance(doc.get("sops"), CommentedMap)
+    )
 
 
-# Supported Kubernetes resource kinds
-SUPPORTED_KINDS = set(SPEC_ORDERS.keys())
-
-
-def is_k8s_manifest(doc: CommentedMap) -> bool:
+def is_k8s_manifest(doc: CommentedMap, config: Optional[Config] = None) -> bool:
     """
     Check if document is a supported Kubernetes manifest.
-    
     Requirements:
     - apiVersion exists and is a string
-    - kind exists and is a supported type (in SPEC_ORDERS)
+    - kind exists and is a supported type (built-in or from config)
     """
     if not isinstance(doc, CommentedMap):
         return False
-    
+
     api_version = doc.get("apiVersion")
     kind = doc.get("kind")
-    
+
     # apiVersion must be a string
     if not isinstance(api_version, str):
         return False
-    
+
     # kind must be a supported type
     if not isinstance(kind, str):
         return False
-    
-    return kind in SUPPORTED_KINDS
+
+    if config:
+        return config.is_supported_kind(kind)
+    return kind in SPEC_ORDERS
 
 
-def format_document(doc: CommentedMap) -> CommentedMap:
+def format_document(doc: CommentedMap, config: Optional[Config] = None) -> CommentedMap:
     """Format a single K8s document."""
     if not isinstance(doc, CommentedMap):
         return doc
@@ -530,7 +648,7 @@ def format_document(doc: CommentedMap) -> CommentedMap:
         return doc
 
     # Skip non-K8s documents
-    if not is_k8s_manifest(doc):
+    if not is_k8s_manifest(doc, config):
         return doc
 
     kind = doc.get("kind", "")
@@ -544,21 +662,35 @@ def format_document(doc: CommentedMap) -> CommentedMap:
 
     # Format spec
     if "spec" in doc and isinstance(doc["spec"], CommentedMap):
-        doc["spec"] = format_spec(doc["spec"], kind)
+        doc["spec"] = format_spec(doc["spec"], kind, config)
+
+    # Format RBAC resources (Role, ClusterRole, RoleBinding, ClusterRoleBinding)
+    if kind in ("Role", "ClusterRole"):
+        _format_list_field(doc, "rules", RBAC_RULE_ORDER)
+
+    if kind in ("RoleBinding", "ClusterRoleBinding"):
+        _format_list_field(doc, "subjects", SUBJECT_ORDER)
+        if "roleRef" in doc and isinstance(doc["roleRef"], CommentedMap):
+            doc["roleRef"] = sort_map(doc["roleRef"], ROLE_REF_ORDER)
 
     return doc
 
 
-def format_yaml_content(content: str) -> tuple[str, bool]:
+def format_yaml_content(content: str, config: Optional[Config] = None) -> tuple[str, bool]:
     """
     Format YAML content and return (formatted_string, has_k8s_manifests).
-    
     Returns the original content unchanged if no K8s manifests are found.
     """
+    # Use config formatting options or defaults
+    indent = config.indent if config else 2
+    sequence_indent = config.sequence_indent if config else 2
+    sequence_offset = config.sequence_offset if config else 0
+    line_width = config.line_width if config else 4096
+
     yaml = YAML()
     yaml.preserve_quotes = True
-    yaml.width = 4096  # Prevent line wrapping
-    yaml.indent(mapping=2, sequence=2, offset=0)
+    yaml.width = line_width
+    yaml.indent(mapping=indent, sequence=sequence_indent, offset=sequence_offset)
 
     # Parse all documents
     docs = list(yaml.load_all(content))
@@ -568,11 +700,9 @@ def format_yaml_content(content: str) -> tuple[str, bool]:
 
     # Check if any document is a K8s manifest
     has_k8s_manifests = any(
-        is_k8s_manifest(doc) and not is_sops_encrypted(doc)
-        for doc in docs
-        if doc is not None
+        is_k8s_manifest(doc, config) and not is_sops_encrypted(doc) for doc in docs if doc is not None
     )
-    
+
     if not has_k8s_manifests:
         return content, False
 
@@ -580,7 +710,7 @@ def format_yaml_content(content: str) -> tuple[str, bool]:
     formatted_docs = []
     for doc in docs:
         if doc is not None:
-            formatted_docs.append(format_document(doc))
+            formatted_docs.append(format_document(doc, config))
 
     if not formatted_docs:
         return content, False
@@ -597,7 +727,13 @@ def format_yaml_content(content: str) -> tuple[str, bool]:
     return result, True
 
 
-def format_file(filepath: Path, check_only: bool = False, show_diff: bool = False, verbose: bool = False) -> bool:
+def format_file(
+    filepath: Path,
+    check_only: bool = False,
+    show_diff: bool = False,
+    verbose: bool = False,
+    config: Optional[Config] = None,
+) -> bool:
     """
     Format a single file.
 
@@ -605,14 +741,25 @@ def format_file(filepath: Path, check_only: bool = False, show_diff: bool = Fals
     """
     try:
         original = filepath.read_text(encoding="utf-8")
-    except Exception as e:
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError, OSError) as e:
         print(f"Error reading {filepath}: {e}", file=sys.stderr)
         return False
 
     try:
-        formatted, has_k8s = format_yaml_content(original)
+        formatted, has_k8s = format_yaml_content(original, config)
+    except (YAMLError, YAMLStreamError) as e:
+        # Extract line/column info from ruamel.yaml errors
+        error_msg = str(e)
+        if hasattr(e, "problem_mark") and e.problem_mark:
+            mark = e.problem_mark
+            error_msg = f"line {mark.line + 1}, column {mark.column + 1}: {e.problem or 'syntax error'}"
+            if hasattr(e, "context") and e.context:
+                error_msg += f" ({e.context})"
+        print(f"YAML error in {filepath}: {error_msg}", file=sys.stderr)
+        return False
     except Exception as e:
-        print(f"Error parsing {filepath}: {e}", file=sys.stderr)
+        # Catch-all for unexpected errors (include type for debugging)
+        print(f"Unexpected error processing {filepath} ({type(e).__name__}): {e}", file=sys.stderr)
         return False
 
     # Skip non-K8s files entirely
@@ -641,7 +788,7 @@ def format_file(filepath: Path, check_only: bool = False, show_diff: bool = Fals
         try:
             filepath.write_text(formatted, encoding="utf-8")
             print(f"Reformatted: {filepath}")
-        except Exception as e:
+        except (PermissionError, OSError) as e:
             print(f"Error writing {filepath}: {e}", file=sys.stderr)
             return False
 
@@ -649,9 +796,7 @@ def format_file(filepath: Path, check_only: bool = False, show_diff: bool = Fals
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Format Kubernetes YAML files with idiomatic key ordering."
-    )
+    parser = argparse.ArgumentParser(description="Format Kubernetes YAML files with idiomatic key ordering.")
     parser.add_argument("files", nargs="*", type=Path, help="YAML files to format")
     parser.add_argument(
         "--check",
@@ -664,9 +809,15 @@ def main():
         help="Show diff without modifying files",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Show skipped files (non-K8s, SOPS-encrypted)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to config file (default: auto-discover .k8s-yaml-fmt.yaml)",
     )
 
     args = parser.parse_args()
@@ -674,6 +825,11 @@ def main():
     if not args.files:
         parser.print_help()
         sys.exit(0)
+
+    # Load configuration
+    config = load_config(args.config)
+    if args.verbose and config.additional_kinds:
+        print(f"Loaded {len(config.additional_kinds)} additional kind(s) from config")
 
     any_changed = False
     any_error = False
@@ -693,6 +849,7 @@ def main():
                 check_only=args.check or args.diff,
                 show_diff=args.diff,
                 verbose=args.verbose,
+                config=config,
             )
             any_changed = any_changed or changed
         except Exception as e:

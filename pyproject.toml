@@ -9,7 +9,7 @@ description = "Kubernetes YAML formatter with idiomatic key ordering"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "you@example.com"}
+    {name = "metawave"}
 ]
 requires-python = ">=3.9"
 classifiers = [
@@ -30,12 +30,18 @@ dependencies = [
     "ruamel.yaml>=0.18",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
 [project.scripts]
 k8s-yaml-fmt = "k8s_yaml_fmt:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/k8s-yaml-fmt"
-Repository = "https://github.com/yourusername/k8s-yaml-fmt"
+Homepage = "https://github.com/metawave/k8s-yaml-fmt"
+Repository = "https://github.com/metawave/k8s-yaml-fmt"
 
 [tool.setuptools]
 py-modules = ["k8s_yaml_fmt"]
