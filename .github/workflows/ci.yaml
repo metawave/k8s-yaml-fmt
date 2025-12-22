@@ -48,8 +48,8 @@ jobs:
       - name: Install pre-commit
         run: pip install pre-commit
 
-      - name: Validate hook config
-        run: pre-commit validate-config .pre-commit-hooks.yaml
+      - name: Validate hook manifest
+        run: pre-commit validate-manifest .pre-commit-hooks.yaml
 
       - name: Test hook locally
         run: |
