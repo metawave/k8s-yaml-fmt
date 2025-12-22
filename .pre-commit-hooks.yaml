@@ -1,0 +1,15 @@
+- id: k8s-yaml-fmt
+  name: Kubernetes YAML Formatter
+  description: Format K8s YAML files with idiomatic key ordering (apiVersion, kind, metadata, spec, ...)
+  entry: k8s-yaml-fmt
+  language: python
+  types: [yaml]
+  additional_dependencies: ['ruamel.yaml>=0.18']
+
+- id: k8s-yaml-fmt-check
+  name: Kubernetes YAML Formatter (check only)
+  description: Check K8s YAML files for correct key ordering without modifying
+  entry: k8s-yaml-fmt --check
+  language: python
+  types: [yaml]
+  additional_dependencies: ['ruamel.yaml>=0.18']

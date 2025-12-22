@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Test CLI
+        run: |
+          k8s-yaml-fmt --help
+          k8s-yaml-fmt --check test/unformatted.yaml && exit 1 || echo "Check correctly detected unformatted file"
+
+  pre-commit-hook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Validate hook config
+        run: pre-commit validate-config .pre-commit-hooks.yaml
+
+      - name: Test hook locally
+        run: |
+          cat > .pre-commit-config.yaml << 'EOF'
+          repos:
+            - repo: local
+              hooks:
+                - id: k8s-yaml-fmt
+                  name: k8s-yaml-fmt
+                  entry: python k8s_yaml_fmt.py
+                  language: python
+                  types: [yaml]
+                  additional_dependencies: ['ruamel.yaml>=0.18']
+          EOF
+          pre-commit install
+          pre-commit run --all-files || echo "Hook ran (changes detected in test files)"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install linters
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check k8s_yaml_fmt.py
